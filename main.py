@@ -5,9 +5,18 @@ from typing_extensions import TypedDict, NotRequired
 from langgraph.graph import StateGraph, START, END, MessagesState
 from langgraph.types import Command
 from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_core.tools import tool
 
 
 REAL_MODEL = False
+
+
+# -- Repo  simulado--
+
+REPO = {"auth.py": "def valida_email(e): \n    return '@' in e # bug: case-sensitive\n"}
+
+_applied_correction = {"done": False}
 
 
 FORGE_INTRODUCTION = SystemMessage(
@@ -26,7 +35,45 @@ else:
             [
                 AIMessage(content="Vou investigar a validação de email."),
                 AIMessage(
-                    content="Encontrei o regex não funciona."
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "read_file",
+                            "args": {
+                                "path": "auth.py"
+                            },
+                            "id": "c2",
+                            "type": "tool_call"
+                        }
+                    ]
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "apply_correction",
+                            "args": {
+                                "path": "auth.py",
+                                "correction": "def valida_email(e): \n    "
+                                    "return '@' in e # bug: case-sensitive\n"
+                            },
+                            "id": "c3",
+                            "type": "tool_call"
+                        }
+                    ]
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "name": "execute_test",
+                            "args": {
+                                "suite": "test_email_validation"
+                            },
+                            "id": "c1",
+                            "type": "tool_call"
+                        }
+                    ]
                 ),
                 AIMessage(
                     content="Correção aplicada: o caso da issue está completo. PRONTO."
@@ -47,6 +94,7 @@ class OutputForge(TypedDict):
     report: str
     history: list
     total_cost: float
+    messages: list
 
 # -- State --
 
@@ -56,9 +104,10 @@ INITIAL_MAX_TRIES = 5
 BUDGET_EXTENSION = TRIES_PER_STRATEGY
 MAX_STRATEGY_CHANGES = 1
 RECURSION_LIMIT = (
-    TRIES_PER_STRATEGY * (1 + MAX_STRATEGY_CHANGES) * 3
+    1  # gather
+    + TRIES_PER_STRATEGY * (1 + MAX_STRATEGY_CHANGES) * 3
     + MAX_STRATEGY_CHANGES
-    + 2
+    + 2  # finish + margem
 )
 
 
@@ -75,14 +124,44 @@ class StateForge(MessagesState):
     history: Annotated[list, operator.add]
     strategies_results: list
 
+# -- Tools --
+
+
+@tool("execute_test", description="Execute a test suite and return the result.")
+def execute_test(suite: str) -> str:
+    if _applied_correction["done"]:
+        return "Resultado: 2 passaram, 0 falharam."
+    return "Resultado: 0 passaram, 2 falharam."
+
+
+@tool("read_file", description="Read a file and return the content.")
+def read_file(path: str) -> str:
+    if path not in REPO:
+        return f"ERROR: '{path}' not found in repo. Files: {list(REPO)}"
+    return REPO[path]
+
+
+@tool("apply_correction", description="Apply a correction to a file.")
+def apply_correction(path: str, correction: str) -> str:
+    if path not in REPO:
+        return f"ERROR: '{path}' not found in repo. Files: {list(REPO)}"
+    REPO[path] = correction
+
+    _applied_correction["done"] = True  
+
+    return f"Ok: path '{path}' updated ({len(correction)} chars)."
+
+
+TOOLS = [read_file, apply_correction, execute_test]
+
 # -- Nodes of workflow --
 
 
 def gather(state: StateForge) -> dict:
     if not state.get("messages"):
         return {
-            "mesages": [HumanMessage(content=f"Issue: {state['issue']}")],
-            "history": ["gather: contexto inicial"]
+            "messages": [HumanMessage(content=f"Issue: {state['issue']}")],
+            "history": ["gather: contexto inicial"],
         }
 
     return {"history": ["gather: contexto reaproveitado"]}
@@ -215,6 +294,8 @@ build_graph.add_node("gather", gather)
 
 build_graph.add_node("act", act)
 
+build_graph.add_node("tools", ToolNode(TOOLS))
+
 build_graph.add_node("verify", verify)
 
 build_graph.add_node("change_strategy", change_strategy)
@@ -233,9 +314,15 @@ build_graph.add_edge(START, "gather")
 
 build_graph.add_edge("gather", "act")
 
-build_graph.add_edge("act", "verify")
+build_graph.add_conditional_edges(
+    "act",
+    tools_condition,
+    {"tools": "tools", "__end__": "verify"},
+)
 
 build_graph.add_edge("change_strategy", "act")
+
+build_graph.add_edge("tools", "act")
 
 build_graph.add_edge("verify", "decide")
 
@@ -268,7 +355,25 @@ if __name__ == "__main__":
 
     print(result['report'])
     print("\nLinha do tempo:")
-    for event in result['history']:
+    for event in result.get("history", []):
         print(f"- {event}")
 
-    print(f"\nCusto total: {result['total_cost']:.2f}")
+    messages = result.get("messages", [])
+    if messages:
+        print("\nMessages:")
+    for message in messages:
+        if getattr(message, "tool_calls", None):
+            tool_calls = message.tool_calls[0]
+
+            print(f"[AI -> tool]- {tool_calls['name']}({tool_calls['args']})")
+        elif message.type == "tool":
+            print(f"[tool -> AI]- {message.content}")
+
+        elif message.type == "ai":
+            print(f"[AI -> Human]- {message.content}")
+
+        elif message.type == "human":
+            print(f"[Human -> AI]- {message.content}")
+
+        else:
+            print(f"[{message.type}]- {message.content}")
