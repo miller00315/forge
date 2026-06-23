@@ -38,6 +38,19 @@ else:
                     content="",
                     tool_calls=[
                         {
+                            "name": "search_in_repo",
+                            "args": {
+                                "query": "valida_email"
+                            },
+                            "id": "c1",
+                            "type": "tool_call"
+                        }
+                    ]
+                ),
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
                             "name": "read_file",
                             "args": {
                                 "path": "auth.py"
@@ -70,7 +83,7 @@ else:
                             "args": {
                                 "suite": "test_email_validation"
                             },
-                            "id": "c1",
+                            "id": "c4",
                             "type": "tool_call"
                         }
                     ]
@@ -100,7 +113,7 @@ class OutputForge(TypedDict):
 
 
 TRIES_PER_STRATEGY = 3
-INITIAL_MAX_TRIES = 5
+INITIAL_MAX_TRIES = 7
 BUDGET_EXTENSION = TRIES_PER_STRATEGY
 MAX_STRATEGY_CHANGES = 1
 RECURSION_LIMIT = (
@@ -147,12 +160,38 @@ def apply_correction(path: str, correction: str) -> str:
         return f"ERROR: '{path}' not found in repo. Files: {list(REPO)}"
     REPO[path] = correction
 
-    _applied_correction["done"] = True  
+    _applied_correction["done"] = True
 
     return f"Ok: path '{path}' updated ({len(correction)} chars)."
 
 
-TOOLS = [read_file, apply_correction, execute_test]
+@tool(
+    "search_in_repo",
+    description="Search for a string in repo file names and file contents.",
+)
+def search_in_repo(query: str) -> str:
+    if not query:
+        return "ERROR: query must not be empty."
+
+    matches = []
+    for path, content in REPO.items():
+        in_path = query in path
+        in_content = query in content
+        if in_path or in_content:
+            locations = []
+            if in_path:
+                locations.append("path")
+            if in_content:
+                locations.append("content")
+            matches.append(f"{path} ({', '.join(locations)})")
+
+    if not matches:
+        return f"No matches for '{query}'. Files: {list(REPO)}"
+
+    return f"Found {len(matches)} file(s): {matches}"
+
+
+TOOLS = [read_file, apply_correction, execute_test, search_in_repo]
 
 # -- Nodes of workflow --
 
