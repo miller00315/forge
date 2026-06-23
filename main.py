@@ -1,64 +1,90 @@
+"""Forge: LangGraph workflow for iterative technical support with tool calling.
+
+The graph gathers context, invokes a chat model, executes repository tools,
+verifies completion, and routes between retry, strategy change, and finish nodes.
+"""
+
+import time
+from enum import Enum
 import operator
 from pathlib import Path
 from typing import Annotated
-from typing_extensions import TypedDict, NotRequired
-from langgraph.graph import StateGraph, START, END, MessagesState
-from langgraph.types import Command
-from langchain_core.messages import AIMessage, SystemMessage, HumanMessage
-from langgraph.prebuilt import ToolNode, tools_condition
-from langchain_core.tools import tool
 
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langgraph.graph import END, START, MessagesState, StateGraph
+from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.types import Command
+from typing_extensions import NotRequired, TypedDict
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
 REAL_MODEL = False
+DONE_KEYWORD = "done"
 
+TRIES_PER_STRATEGY = 3
+INITIAL_MAX_TRIES = 20
+BUDGET_EXTENSION = TRIES_PER_STRATEGY
+MAX_STRATEGY_CHANGES = 1
+RECURSION_LIMIT = (
+    1  # gather
+    + TRIES_PER_STRATEGY * (1 + MAX_STRATEGY_CHANGES) * 3
+    + MAX_STRATEGY_CHANGES
+    + 2  # finish + safety margin
+)
 
-# -- Repo  simulado--
+GRAPH_IMAGE_PATH = Path(__file__).parent / "forge_graph.png"
+PASS_THRESHOLD = 3
+
+# ---------------------------------------------------------------------------
+# Simulated repository
+# ---------------------------------------------------------------------------
 
 REPO = {"auth.py": "def valida_email(e): \n    return '@' in e # bug: case-sensitive\n"}
 
 _applied_correction = {"done": False}
 
-
 FORGE_INTRODUCTION = SystemMessage(
-    content="Você é um assistente de suporte técnico que resolve problemas de sistemas."
-    "Quando a correção cobrir o problema, termine com a palavra PRONTO."
+    content=(
+        "You are a technical support assistant that fixes system issues. "
+        f"When the fix covers the issue, end with the word {DONE_KEYWORD.upper()}."
+    )
 )
-
 
 if REAL_MODEL:
     from langchain.chat_models import init_chat_model
+
     model = init_chat_model("claude-haiku-4-5", model_provider="anthropic")
 else:
     from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+
     model = GenericFakeChatModel(
         messages=iter(
             [
-                AIMessage(content="Vou investigar a validação de email."),
+                AIMessage(content="I will investigate email validation."),
                 AIMessage(
                     content="",
                     tool_calls=[
                         {
                             "name": "search_in_repo",
-                            "args": {
-                                "query": "valida_email"
-                            },
+                            "args": {"query": "valida_email"},
                             "id": "c1",
-                            "type": "tool_call"
+                            "type": "tool_call",
                         }
-                    ]
+                    ],
                 ),
                 AIMessage(
                     content="",
                     tool_calls=[
                         {
                             "name": "read_file",
-                            "args": {
-                                "path": "auth.py"
-                            },
+                            "args": {"path": "auth.py"},
                             "id": "c2",
-                            "type": "tool_call"
+                            "type": "tool_call",
                         }
-                    ]
+                    ],
                 ),
                 AIMessage(
                     content="",
@@ -67,88 +93,119 @@ else:
                             "name": "apply_correction",
                             "args": {
                                 "path": "auth.py",
-                                "correction": "def valida_email(e): \n    "
+                                "correction": (
+                                    "def valida_email(e): \n    "
                                     "return '@' in e # bug: case-sensitive\n"
+                                ),
                             },
                             "id": "c3",
-                            "type": "tool_call"
+                            "type": "tool_call",
                         }
-                    ]
+                    ],
                 ),
                 AIMessage(
                     content="",
                     tool_calls=[
                         {
                             "name": "execute_test",
-                            "args": {
-                                "suite": "test_email_validation"
-                            },
+                            "args": {"suite": "test_email_validation"},
                             "id": "c4",
-                            "type": "tool_call"
+                            "type": "tool_call",
                         }
-                    ]
+                    ],
                 ),
                 AIMessage(
-                    content="Correção aplicada: o caso da issue está completo. PRONTO."
-                )
+                    content=(
+                        "Fix applied: the issue case is complete. "
+                        f"{DONE_KEYWORD.upper()}."
+                    )
+                ),
             ]
         )
     )
 
+# ---------------------------------------------------------------------------
+# Input / output schemas
+# ---------------------------------------------------------------------------
 
-# -- facade --
+
+class SCENARIOS(Enum):
+    SUCCESS = "success"
+    STUCK = "stuck"
+    BUDGET_EXCEEDED = "budget_exceeded"
+
+
+class STOP_REASONS(Enum):
+    BUDGET_EXCEEDED = "budget_exceeded"
+    STUCK_DETECTED = "stuck_detected"
+    NO_OUTCOME = "no_outcome"
+    OSCILATION_DETECTED = "oscillation_detected"
+    SUCCESS = "success"
+
+
+class ACTION_PATTERNS(Enum):
+    UNIFORM = "uniform"
+    ALTERNATING = "alternating"
+
 
 class InputForge(TypedDict):
+    """Public graph input."""
+
     issue: str
+    scenario: NotRequired[SCENARIOS]
     max_tries: NotRequired[int]
+    start: NotRequired[float]
+    max_seconds: NotRequired[float]
+    patience: NotRequired[int]
 
 
 class OutputForge(TypedDict):
+    """Public graph output."""
+
     report: str
     history: list
     total_cost: float
     messages: list
 
-# -- State --
-
-
-TRIES_PER_STRATEGY = 3
-INITIAL_MAX_TRIES = 7
-BUDGET_EXTENSION = TRIES_PER_STRATEGY
-MAX_STRATEGY_CHANGES = 1
-RECURSION_LIMIT = (
-    1  # gather
-    + TRIES_PER_STRATEGY * (1 + MAX_STRATEGY_CHANGES) * 3
-    + MAX_STRATEGY_CHANGES
-    + 2  # finish + margem
-)
-
 
 class StateForge(MessagesState):
+    """Internal graph state."""
+
     issue: str
+    scenario: SCENARIOS
     tries: int
+    start: float
     max_tries: int
+    max_seconds: float
+    patience: int
+    scores: Annotated[list[float], operator.add]
+    best_score: float
     test_ok: bool
     report: str
-    stop_reason: str
+    actions: Annotated[list, operator.add]
+    stop_reason: STOP_REASONS
     strategy_changes: int
     messages: Annotated[list, operator.add]
     total_cost: Annotated[float, operator.add]
     history: Annotated[list, operator.add]
-    strategies_results: list
 
-# -- Tools --
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
 
 @tool("execute_test", description="Execute a test suite and return the result.")
 def execute_test(suite: str) -> str:
+    """Run a test suite against the simulated repository."""
     if _applied_correction["done"]:
-        return "Resultado: 2 passaram, 0 falharam."
-    return "Resultado: 0 passaram, 2 falharam."
+        return "Result: 2 passed, 0 failed."
+    return "Result: 0 passed, 2 failed."
 
 
 @tool("read_file", description="Read a file and return the content.")
 def read_file(path: str) -> str:
+    """Return file contents from the in-memory repository."""
     if path not in REPO:
         return f"ERROR: '{path}' not found in repo. Files: {list(REPO)}"
     return REPO[path]
@@ -156,13 +213,12 @@ def read_file(path: str) -> str:
 
 @tool("apply_correction", description="Apply a correction to a file.")
 def apply_correction(path: str, correction: str) -> str:
+    """Overwrite a repository file and mark the correction as applied."""
     if path not in REPO:
         return f"ERROR: '{path}' not found in repo. Files: {list(REPO)}"
     REPO[path] = correction
-
     _applied_correction["done"] = True
-
-    return f"Ok: path '{path}' updated ({len(correction)} chars)."
+    return f"OK: path '{path}' updated ({len(correction)} chars)."
 
 
 @tool(
@@ -170,6 +226,7 @@ def apply_correction(path: str, correction: str) -> str:
     description="Search for a string in repo file names and file contents.",
 )
 def search_in_repo(query: str) -> str:
+    """Find files whose path or content contains the query string."""
     if not query:
         return "ERROR: query must not be empty."
 
@@ -193,125 +250,211 @@ def search_in_repo(query: str) -> str:
 
 TOOLS = [read_file, apply_correction, execute_test, search_in_repo]
 
-# -- Nodes of workflow --
+# ---------------------------------------------------------------------------
+# Workflow nodes
+# ---------------------------------------------------------------------------
 
 
-def gather(state: StateForge) -> dict:
-    if not state.get("messages"):
-        return {
-            "messages": [HumanMessage(content=f"Issue: {state['issue']}")],
-            "history": ["gather: contexto inicial"],
-        }
-
-    return {"history": ["gather: contexto reaproveitado"]}
+def _resolve_scenario(state: StateForge) -> SCENARIOS:
+    """Return the active scenario, defaulting to SUCCESS."""
+    scenario = state.get("scenario", SCENARIOS.SUCCESS)
+    if isinstance(scenario, str):
+        return SCENARIOS(scenario)
+    return scenario
 
 
-def act(state: StateForge) -> dict:
+def _has_repeating_period(sequence: list[str], period: int) -> bool:
+    """Return True if sequence equals its prefix repeated (e.g. ABAB has period 2)."""
+    if period <= 0 or period > len(sequence):
+        return False
+    return all(sequence[i] == sequence[i - period] for i in range(period, len(sequence)))
+
+
+def detect_action_pattern(window: list[str]) -> ACTION_PATTERNS | None:
+    """Classify a window as uniform (period 1) or alternating (period 2)."""
+    if not window:
+        return None
+    if _has_repeating_period(window, 1):
+        return ACTION_PATTERNS.UNIFORM
+    if len(window) >= 2 and _has_repeating_period(window, 2) and len(set(window)) == 2:
+        return ACTION_PATTERNS.ALTERNATING
+    return None
+
+
+def detect_repetitive_pattern(
+    actions: list[str],
+    window_size: int = 4,
+) -> ACTION_PATTERNS | None:
+    """Classify the last N actions as uniform, alternating, or no pattern."""
+    if len(actions) < window_size:
+        return None
+    return detect_action_pattern(actions[-window_size:])
+
+
+def _action_label(scenario: SCENARIOS, tries: int, score: float) -> str:
+    """Map an attempt to action label A or B for pattern detection."""
+    match scenario:
+        case SCENARIOS.STUCK:
+            return "A"
+        case SCENARIOS.BUDGET_EXCEEDED:
+            return "A" if score <= 1 else "B"
+        case SCENARIOS.SUCCESS:
+            return "B" if score >= PASS_THRESHOLD else "A"
+
+
+def try_and_verify(state: StateForge) -> dict:
+    """Simulate one attempt and score it according to the active scenario."""
     tries = state.get("tries", 0) + 1
+    scenario = _resolve_scenario(state)
 
-    result = model.invoke([FORGE_INTRODUCTION] + state['messages'])
+    match scenario:
+        case SCENARIOS.SUCCESS:
+            score = min(tries, PASS_THRESHOLD)
+        case SCENARIOS.STUCK:
+            score = 1
+        case SCENARIOS.BUDGET_EXCEEDED:
+            score = 1 if tries % 2 else 2
 
     return {
-        "messages": [result],
         "tries": tries,
-        "history": [f"act (try {tries}): {result.content[:60]}"],
+        "scores": [score],
+        "actions": [_action_label(scenario, tries, score)],
+        "history": [f"try {tries}: {score}/{PASS_THRESHOLD} tests passed"],
     }
 
 
-def verify(state: StateForge) -> dict:
-    """
-    Simulate a verification of the correction.
-    """
-    passed = "pronto" in state['messages'][-1].content.lower()
+def gather(state: StateForge) -> dict:
+    """Seed the conversation with the issue or reuse existing context."""
+    if not state.get("messages"):
+        return {
+            "messages": [HumanMessage(content=f"Issue: {state['issue']}")],
+            "history": ["gather: initial context"],
+        }
 
-    status = "success" if passed else "failed"
-    strategies = list(state.get("strategies_results", []))
-    strategies.append(status)
+    return {"history": ["gather: reused context"]}
+
+
+def verify(state: StateForge) -> dict:
+    """Check whether the latest attempt score meets the pass threshold."""
+    scores = state.get("scores", [])
+    last_score = scores[-1] if scores else 0
+    passed = last_score >= PASS_THRESHOLD
 
     return {
         "test_ok": passed,
-        "history": [f"tentativa {'verdes' if passed else 'vermelhos'}"],
-        "strategies_results": strategies,
+        "history": [f"attempt {'passed' if passed else 'failed'}"],
     }
 
 
 def change_strategy(state: StateForge) -> dict:
+    """Reset failure window and extend the attempt budget."""
     current_budget = state.get("max_tries", INITIAL_MAX_TRIES)
     return {
-        "history": ["decision: mudar estratégia"],
-        "messages": [HumanMessage(content="Vamos tentar outra estratégia.")],
+        "history": ["decision: change strategy"],
+        "messages": [HumanMessage(content="Let's try a different strategy.")],
         "strategies_results": [],
         "max_tries": current_budget + BUDGET_EXTENSION,
     }
 
 
 def decide(state: StateForge) -> Command:
-    if state["test_ok"]:
-        return Command(
-            update={
-                "stop_reason": "success",
-                "history": ["decision: encerrar -testes verdes"]
-            },
-            goto="finish"
-        )
+    """Route to finish, strategy change, or another act attempt."""
+    scores = state.get("scores", [])
+    last = scores[-1] if scores else 0
+    best = max(scores)
 
-    if state["tries"] >= state.get("max_tries", INITIAL_MAX_TRIES):
+    if last >= PASS_THRESHOLD:
         return Command(
             update={
-                "stop_reason": "budget_exceeded",
-                "history": ["decision: encerrar - orçamento excedido"]
-            },
-            goto="finish"
-        )
-
-    strategies = state.get("strategies_results", [])
-    last_three_failed = (
-        len(strategies) >= TRIES_PER_STRATEGY
-        and all(result == "failed" for result in strategies[-TRIES_PER_STRATEGY:])
-    )
-    if last_three_failed:
-        if state.get("strategy_changes", 0) < MAX_STRATEGY_CHANGES:
-            return Command(
-                update={
-                    "strategy_changes": state.get("strategy_changes", 0) + 1,
-                },
-                goto="change_strategy",
-            )
-        return Command(
-            update={
-                "stop_reason": "budget_exceeded",
-                "history": ["decision: encerrar - orçamento excedido"],
+                "stop_reason": STOP_REASONS.SUCCESS,
+                "best_score": best,
             },
             goto="finish",
         )
 
-    return Command(
-        update={
-            "history": ["decision: iterate - ainda há orçamento"]
-        },
-        goto="act"
-    )
+    if state.get("tries", 0) >= state.get("max_tries", INITIAL_MAX_TRIES):
+        return Command(
+            update={
+                "stop_reason": STOP_REASONS.BUDGET_EXCEEDED,
+                "best_score": best,
+            },
+            goto="finish",
+        )
+
+    if time.time() - state.get("start", 0) >= state.get("max_seconds", 0):
+        return Command(
+            update={
+                "stop_reason": STOP_REASONS.NO_OUTCOME,
+                "best_score": best,
+            },
+            goto="finish",
+        )
+
+    patience = state.get("patience", 3)
+    if (
+        patience > 0
+        and len(scores) > patience
+        and max(scores[-patience:]) <= max(scores[:-patience])
+    ):
+        return Command(
+            update={
+                "stop_reason": STOP_REASONS.STUCK_DETECTED,
+                "best_score": best,
+            },
+            goto="finish",
+        )
+
+    actions = state.get("actions", [])
+    pattern = detect_repetitive_pattern(actions, window_size=4)
+    if pattern is not None:
+        return Command(
+            update={
+                "stop_reason": STOP_REASONS.OSCILATION_DETECTED,
+                "best_score": best,
+                "history": [
+                    f"decision: {pattern.value} pattern detected in last 4 actions"
+                ],
+            },
+            goto="finish",
+        )
+
+    return Command(goto="try_and_verify")
 
 
 def finish(state: StateForge) -> dict:
-    """
-    Finish the process.
-    """
-    if state["stop_reason"] == "success":
-        report = f"The issue has been corrected in {state['tries']} attempts."
-        report += f"Reason: {state['stop_reason']}."
+    """Build the final report from the stop reason."""
 
-        return {
-            "report": report,
-        }
-
-    elif state["stop_reason"] == "budget_exceeded":
-        report = f"The issue has not been corrected in {state['tries']} attempts."
-        report += f"Reason: {state['stop_reason']}."
-
-        return {
-            "report": report,
-        }
+    match state["stop_reason"]:
+        case STOP_REASONS.SUCCESS:
+            report = (
+                f"The issue has been corrected in {state['tries']} attempts. "
+                f"Reason: {state['stop_reason']}."
+            )
+            return {"report": report}
+        case STOP_REASONS.BUDGET_EXCEEDED:
+            report = (
+                f"The issue has not been corrected in {state['tries']} attempts. "
+                f"Reason: {state['stop_reason']}."
+            )
+            return {"report": report}
+        case STOP_REASONS.STUCK_DETECTED:
+            report = (
+                f"The issue has not been corrected in {state['tries']} attempts. "
+                f"Reason: {state['stop_reason']}."
+            )
+            return {"report": report}
+        case STOP_REASONS.NO_OUTCOME:
+            report = (
+                f"The issue has not been corrected in {state['tries']} attempts. "
+                f"Reason: {state['stop_reason']}."
+            )
+            return {"report": report}
+        case STOP_REASONS.OSCILATION_DETECTED:
+            report = (
+                f"The issue has not been corrected in {state['tries']} attempts. "
+                f"Reason: {state['stop_reason']}."
+            )
+            return {"report": report}
 
     return {
         "report": (
@@ -320,99 +463,89 @@ def finish(state: StateForge) -> dict:
         ),
     }
 
-# -- Graph --
+
+# ---------------------------------------------------------------------------
+# Graph assembly
+# ---------------------------------------------------------------------------
 
 
 build_graph = StateGraph(
     StateForge,
     input_schema=InputForge,
-    output_schema=OutputForge
+    output_schema=OutputForge,
 )
 
 build_graph.add_node("gather", gather)
-
-build_graph.add_node("act", act)
-
+build_graph.add_node("try_and_verify", try_and_verify)
 build_graph.add_node("tools", ToolNode(TOOLS))
-
 build_graph.add_node("verify", verify)
-
 build_graph.add_node("change_strategy", change_strategy)
-
 build_graph.add_node(
     "decide",
     decide,
-    destinations=("act", "finish", "change_strategy")
+    destinations=("try_and_verify", "finish", "change_strategy"),
 )
-
 build_graph.add_node("finish", finish)
 
-# -- Edges of workflow --
-
 build_graph.add_edge(START, "gather")
-
-build_graph.add_edge("gather", "act")
-
+build_graph.add_edge("gather", "try_and_verify")
 build_graph.add_conditional_edges(
-    "act",
+    "try_and_verify",
     tools_condition,
     {"tools": "tools", "__end__": "verify"},
 )
-
-build_graph.add_edge("change_strategy", "act")
-
-build_graph.add_edge("tools", "act")
-
+build_graph.add_edge("change_strategy", "try_and_verify")
+build_graph.add_edge("tools", "try_and_verify")
 build_graph.add_edge("verify", "decide")
-
 build_graph.add_edge("finish", END)
 
 forge_graph = build_graph.compile()
 
-GRAPH_IMAGE_PATH = Path(__file__).parent / "forge_graph.png"
-
 
 def save_graph_png(path: Path = GRAPH_IMAGE_PATH) -> Path:
+    """Render the compiled graph to a PNG file."""
     forge_graph.get_graph().draw_mermaid_png(output_file_path=str(path))
     return path
 
-# -- Run --
+
+def print_messages(messages: list) -> None:
+    """Print the conversation transcript in a readable format."""
+    for message in messages:
+        if getattr(message, "tool_calls", None):
+            tool_call = message.tool_calls[0]
+            print(f"[AI -> tool] {tool_call['name']}({tool_call['args']})")
+        elif message.type == "tool":
+            print(f"[tool -> AI] {message.content}")
+        elif message.type == "ai":
+            print(f"[AI -> Human] {message.content}")
+        elif message.type == "human":
+            print(f"[Human -> AI] {message.content}")
+        else:
+            print(f"[{message.type}] {message.content}")
 
 
 if __name__ == "__main__":
-
     save_graph_png()
-    print(f"Grafo salvo em: {GRAPH_IMAGE_PATH}")
+    print(f"Graph saved at: {GRAPH_IMAGE_PATH}")
 
-    result = forge_graph.invoke(
-        {
-            "issue": "O sistema não está respondendo ao email do cliente.", 
-            "max_tries": INITIAL_MAX_TRIES
-        },
-        config={"recursion_limit": RECURSION_LIMIT},
-    )
+    for scenario in SCENARIOS:
+        result = forge_graph.invoke(
+            {
+                "issue": "The system is not responding to the customer email.",
+                "scenario": scenario,
+                "max_tries": INITIAL_MAX_TRIES,
+                "start": time.time(),
+                "max_seconds": 60.0,
+                "patience": 3,
+            },
+            config={"recursion_limit": RECURSION_LIMIT},
+        )
+        print(result["report"])
+        print("\nTimeline:")
+        for event in result.get("history", []):
+            print(f"- {event}")
+        messages = result.get("messages", [])
+        if messages:
+            print("\nMessages:")
+            print_messages(messages)
 
-    print(result['report'])
-    print("\nLinha do tempo:")
-    for event in result.get("history", []):
-        print(f"- {event}")
-
-    messages = result.get("messages", [])
-    if messages:
-        print("\nMessages:")
-    for message in messages:
-        if getattr(message, "tool_calls", None):
-            tool_calls = message.tool_calls[0]
-
-            print(f"[AI -> tool]- {tool_calls['name']}({tool_calls['args']})")
-        elif message.type == "tool":
-            print(f"[tool -> AI]- {message.content}")
-
-        elif message.type == "ai":
-            print(f"[AI -> Human]- {message.content}")
-
-        elif message.type == "human":
-            print(f"[Human -> AI]- {message.content}")
-
-        else:
-            print(f"[{message.type}]- {message.content}")
